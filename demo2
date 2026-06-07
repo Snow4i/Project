@@ -1,0 +1,487 @@
+import os
+import sys
+import shutil
+import pymysql
+from PyQt6.QtWidgets import *
+from PyQt6.QtCore import *
+from PyQt6.QtGui import *
+
+# Настройки подключения (DictCursor — строки как словарь: row["name"])
+DB = dict(host="localhost", port=3307, user="root", password="root", database="demo_exam",
+          cursorclass=pymysql.cursors.DictCursor)
+
+# Стили интерфейса — светлая тема
+CSS = """
+QMainWindow,QWidget,QDialog,QScrollArea{background:#F5F5F5;color:#212121}
+QLineEdit{background:#FFF;border:1px solid #CCC;border-radius:6px;padding:8px}
+QPushButton{background:#FFF;border:1px solid #CCC;border-radius:6px;padding:6px 12px}
+QPushButton:hover{background:#EEE}
+QPushButton#primaryBtn{background:#0078D7;color:#FFF;border:none;font-weight:bold}
+QPushButton#dangerBtn{color:#D32F2F}
+QFrame#itemCard{background:#FFF;border:1px solid #E0E0E0;border-radius:10px}
+QWidget#headerBar{background:#FFF;border-bottom:1px solid #E0E0E0}
+QLabel#cardTitle,QLabel#priceLabel{font-weight:bold}
+QLabel#statusOk{color:#388E3C} QLabel#statusOff{color:#D32F2F}
+"""
+
+# --- Блок 1. Работа с базой данных ---
+
+def db(sql, params=(), one=False):
+    # Выполняет SQL-запрос: SELECT возвращает строки, INSERT/UPDATE/DELETE сохраняет изменения
+    try:
+        with pymysql.connect(**DB) as con, con.cursor() as cur:
+            cur.execute(sql, params)
+            if cur.description:  # если запрос SELECT — есть описание столбцов
+                return cur.fetchone() if one else cur.fetchall()
+            con.commit()
+    except pymysql.err.OperationalError as e:
+        if e.args[0] == 2003:  # MySQL не запущен или неверный порт
+            QMessageBox.critical(None, "Ошибка БД",
+                "Не удалось подключиться к MySQL.\nЗапустите MySQL80, порт 3307.\n"
+                "Создайте БД по SQL в конце main.py.")
+        raise
+
+def final_price(price, discount):
+    # Цена с учётом скидки в процентах (поле discount в таблице products)
+    return round(float(price) * (1 - int(discount or 0) / 100), 2)
+
+def is_available(item):
+    # Товар «доступен», если не удалён и есть остаток на складе
+    return item["is_deleted"] == 0 and item["quantity"] > 0
+
+def img_path(name):
+    # Ищет файл фото: в images/, photos/ или по полному пути
+    if not name:
+        return None
+    if os.path.isabs(name) and os.path.exists(name):
+        return name
+    for p in (name, f"images/{name}", f"photos/{name}"):
+        if os.path.exists(p):
+            return p
+    return None
+
+def default_category_id():
+    # Первая категория из БД — для нового товара из простой формы админа
+    row = db("SELECT id FROM categories ORDER BY id LIMIT 1", one=True)
+    return row["id"] if row else 1
+
+def next_article():
+    # Авто-артикул T001, T002… при добавлении товара через админку
+    row = db("SELECT MAX(id) AS m FROM products", one=True)
+    return f"T{(row['m'] or 0) + 1:03d}"
+
+# --- Блок 2. Вспомогательные элементы интерфейса ---
+
+def btn(text, slot=None, kind="default"):
+    # Создаёт кнопку: default / primary (синяя) / danger (красная) / accent
+    styles = {"primary": "primaryBtn", "danger": "dangerBtn", "default": "defaultBtn", "accent": "defaultBtn"}
+    b = QPushButton(text)
+    b.setObjectName(styles[kind])
+    if slot:
+        b.clicked.connect(slot)
+    return b
+
+def top_bar(title, buttons):
+    # Верхняя белая панель: заголовок слева, кнопки справа
+    bar = QWidget()
+    bar.setObjectName("headerBar")
+    bar.setFixedHeight(52)
+    row = QHBoxLayout(bar)
+    row.setContentsMargins(16, 6, 16, 6)
+    row.addWidget(QLabel(title))
+    row.addStretch()
+    for text, slot, kind in buttons:
+        row.addWidget(btn(text, slot, kind))
+    return bar
+
+def make_card(w=280, h=400):
+    # Белая карточка товара в сетке каталога
+    frame = QFrame()
+    frame.setObjectName("itemCard")
+    frame.setFixedSize(w, h)
+    layout = QVBoxLayout(frame)
+    layout.setContentsMargins(12, 12, 12, 12)
+    layout.setSpacing(6)
+    return frame, layout
+
+def show_photo(path, w=260, h=180):
+    # Показывает фото товара или надпись «Нет фото»
+    lab = QLabel()
+    lab.setFixedSize(w, h)
+    lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    lab.setScaledContents(True)
+    lab.setStyleSheet("border:1px dashed #CCC;border-radius:8px;background:#FAFAFA;color:#999")
+    p = img_path(path)
+    if p:
+        lab.setPixmap(QPixmap(p).scaled(w, h, Qt.AspectRatioMode.KeepAspectRatio))
+    else:
+        lab.setText("Нет фото")
+    return lab
+
+def clear_grid(grid):
+    # Очищает сетку карточек перед новой загрузкой из БД
+    for i in reversed(range(grid.count())):
+        w = grid.itemAt(i).widget()
+        if w:
+            w.deleteLater()
+
+def back_login(login, win):
+    # Возврат на экран входа (не закрываем приложение)
+    login.user.clear()
+    login.pwd.clear()
+    login.show()
+    win._out = True  # флаг: выход через кнопку, не через крестик
+    win.close()
+
+# --- Блок 3. Окно авторизации ---
+
+class Login(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Вход")
+        self.resize(300, 240)
+        box = QVBoxLayout(self)
+        box.addWidget(QLabel("Логин:"))
+        self.user = QLineEdit()
+        box.addWidget(self.user)
+        box.addWidget(QLabel("Пароль:"))
+        self.pwd = QLineEdit()
+        self.pwd.setEchoMode(QLineEdit.EchoMode.Password)  # скрытый ввод пароля
+        box.addWidget(self.pwd)
+        box.addWidget(btn("Войти", self.auth))
+        box.addWidget(btn("Как гость", self.as_guest))
+        box.addWidget(btn("Выход", QApplication.instance().quit))
+
+    def open_user(self, u):
+        # Открывает окно по имени роли из таблицы roles
+        if u["role_name"] in ("admin", "manager"):
+            w = Admin(u, self)
+        elif u["role_name"] in ("client", "guest"):
+            w = Client(u, self)
+        else:
+            QMessageBox.warning(self, "Ошибка", "Неизвестная роль")
+            return
+        w.show()
+        self.hide()  # hide, не close — чтобы вернуться назад
+
+    def as_guest(self):
+        # Гость без проверки БД — только просмотр каталога
+        self.open_user({"role_name": "guest", "login": "Гость", "full_name": "Гость"})
+
+    def auth(self):
+        # Проверка login и password в таблице users, роль из roles
+        try:
+            u = db("""SELECT u.*, r.name AS role_name FROM users u
+                      JOIN roles r ON u.role_id=r.id
+                      WHERE u.login=%s AND u.password=%s""",
+                   (self.user.text(), self.pwd.text()), one=True)
+        except pymysql.err.OperationalError:
+            return
+        if not u:
+            QMessageBox.warning(self, "Ошибка", "Неверный логин или пароль")
+            return
+        self.open_user(u)
+
+# --- Блок 4. Окно администратора / менеджера ---
+
+class Admin(QMainWindow):
+    def __init__(self, user, login):
+        super().__init__()
+        self.login = login
+        self.sort = None      # ASC или DESC — сортировка по цене
+        self._out = False
+        name = user.get("login") or user.get("full_name", "")
+        self.setWindowTitle("Админ — " + name)
+        self.resize(960, 600)
+        os.makedirs("images", exist_ok=True)
+
+        # Сетка карточек 3 в ряд внутри прокрутки
+        self.grid_w = QWidget()
+        self.grid = QGridLayout(self.grid_w)
+        self.grid.setSpacing(14)
+        self.grid.setContentsMargins(16, 16, 16, 16)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.grid_w)
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(top_bar("Панель администратора — " + name, [
+            ("+ Добавить", self.add, "accent"),
+            ("Цена ↑", lambda: self.set_sort("ASC"), "default"),
+            ("Цена ↓", lambda: self.set_sort("DESC"), "default"),
+            ("Выход", self.logout, "danger"),
+        ]))
+        layout.addWidget(scroll)
+        self.setCentralWidget(page)
+        self.load()
+
+    def set_sort(self, order):
+        self.sort = order
+        self.load()
+
+    def load(self):
+        # Загрузка всех неудалённых товаров из products
+        clear_grid(self.grid)
+        sql = "SELECT * FROM products WHERE is_deleted=0"
+        if self.sort:
+            sql += f" ORDER BY price {self.sort}"
+        row = col = 0
+        for item in db(sql):
+            frame, box = make_card()
+            box.addWidget(show_photo(item.get("image")))
+            title = QLabel(item["name"])
+            title.setObjectName("cardTitle")
+            box.addWidget(title)
+            price = QLabel(str(final_price(item["price"], item["discount"])) + " ₽")
+            price.setObjectName("priceLabel")
+            box.addWidget(price)
+            if is_available(item):
+                st = QLabel("● Доступно")
+                st.setObjectName("statusOk")
+            else:
+                st = QLabel("● Недоступно")
+                st.setObjectName("statusOff")
+            box.addWidget(st)
+            btns = QHBoxLayout()
+            pid = item["id"]
+            # checked=False — PyQt6 передаёт лишний аргумент в lambda при clicked
+            btns.addWidget(btn("Изменить", lambda checked=False, x=pid: self.edit(x)))
+            btns.addWidget(btn("Удалить", lambda checked=False, x=pid: self.delete(x), "danger"))
+            box.addLayout(btns)
+            self.grid.addWidget(frame, row, col)
+            col += 1
+            if col == 3:
+                col, row = 0, row + 1
+
+    def delete(self, product_id):
+        # Мягкое удаление: is_deleted=1 (строка остаётся в БД)
+        if QMessageBox.question(self, "", "Удалить?") != QMessageBox.StandardButton.Yes:
+            return
+        row = db("SELECT image FROM products WHERE id=%s", (product_id,), one=True)
+        if row and row.get("image"):
+            p = img_path(row["image"])
+            if p and p.startswith("images/"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        db("UPDATE products SET is_deleted=1 WHERE id=%s", (product_id,))
+        self.load()
+
+    def add(self):
+        self.edit(None)  # product_id=None — режим добавления
+
+    def edit(self, product_id):
+        # Диалог: название, цена, фото, галочка «Доступен»
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Позиция")
+        dialog.resize(400, 520)
+        box = QVBoxLayout(dialog)
+        name = QLineEdit()
+        price = QLineEdit()
+        available = QCheckBox("Доступен")
+        available.setChecked(True)
+        preview = show_photo(None, 380, 250)
+        photo_path = [None]  # список — чтобы менять путь во вложенных функциях
+
+        if product_id:
+            item = db("SELECT * FROM products WHERE id=%s", (product_id,), one=True)
+            if item:
+                name.setText(item["name"])
+                price.setText(str(final_price(item["price"], item["discount"])))
+                available.setChecked(is_available(item))
+                if img_path(item.get("image")):
+                    photo_path[0] = item["image"]
+                    preview.setPixmap(QPixmap(img_path(item["image"])).scaled(
+                        380, 250, Qt.AspectRatioMode.KeepAspectRatio))
+
+        def pick():
+            path, _ = QFileDialog.getOpenFileName(dialog, "Фото", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif)")
+            if path:
+                photo_path[0] = path
+                preview.setPixmap(QPixmap(path).scaled(380, 250, Qt.AspectRatioMode.KeepAspectRatio))
+
+        def remove():
+            photo_path[0] = ""  # пустая строка = удалить фото
+            preview.clear()
+            preview.setText("Нет фото")
+
+        for w in [QLabel("Название:"), name, QLabel("Цена:"), price, QLabel("Фото:"), preview,
+                  btn("Выбрать фото", pick), btn("Удалить фото", remove, "danger"), available]:
+            box.addWidget(w)
+
+        def copy_photo(target_id, nm):
+            # Копирует выбранное фото в папку images/
+            if not photo_path[0] or photo_path[0] == "":
+                return None
+            ext = os.path.splitext(photo_path[0])[1] or ".jpg"
+            dst = f"images/{nm.replace(' ', '_')}_{target_id}{ext}"
+            shutil.copy2(photo_path[0], dst)
+            return os.path.basename(dst)  # в БД храним только имя файла
+
+        def save():
+            nm = name.text().strip()
+            if not nm:
+                QMessageBox.warning(dialog, "Ошибка", "Введите название")
+                return
+            try:
+                pr = float(price.text().replace(",", "."))
+            except ValueError:
+                QMessageBox.warning(dialog, "Ошибка", "Проверьте цену")
+                return
+            # «Доступен» = quantity>0; снятая галочка = quantity 0
+            qty = 10 if available.isChecked() else 0
+
+            if product_id:
+                old = db("SELECT image FROM products WHERE id=%s", (product_id,), one=True)
+                new_img = old.get("image") if old else None
+                if photo_path[0] == "":
+                    new_img = None
+                elif photo_path[0] and not (old and photo_path[0] == old.get("image")):
+                    new_img = copy_photo(product_id, nm)
+                db("""UPDATE products SET name=%s, price=%s, discount=0, quantity=%s, image=%s
+                      WHERE id=%s""", (nm, pr, qty, new_img, product_id))
+            else:
+                # INSERT в одном подключении — чтобы получить id для привязки фото
+                art = next_article()
+                cat = default_category_id()
+                with pymysql.connect(**DB) as con, con.cursor() as cur:
+                    cur.execute("""INSERT INTO products
+                        (article, name, category_id, description, price, discount, quantity,
+                         manufacturer, supplier, unit, image, is_deleted)
+                        VALUES (%s,%s,%s,NULL,%s,0,%s,NULL,NULL,'шт.',NULL,0)""",
+                                (art, nm, cat, pr, qty))
+                    new_id = cur.lastrowid
+                    con.commit()
+                if photo_path[0]:
+                    img = copy_photo(new_id, nm)
+                    db("UPDATE products SET image=%s WHERE id=%s", (img, new_id))
+            dialog.accept()
+            self.load()
+
+        box.addWidget(btn("Сохранить", save, "primary"))
+        dialog.exec()
+
+    def logout(self):
+        back_login(self.login, self)
+
+    def closeEvent(self, e):
+        # Закрытие крестиком — тоже возврат на экран входа
+        if self.login.isHidden() and not self._out:
+            back_login(self.login, self)
+        e.accept()
+
+# --- Блок 5. Окно клиента / гостя ---
+
+class Client(QMainWindow):
+    def __init__(self, user, login):
+        super().__init__()
+        self.login = login
+        self.sort = None
+        self._out = False
+        if user["role_name"] == "guest":
+            self.setWindowTitle("Гость — каталог")
+        else:
+            self.setWindowTitle("Клиент: " + (user.get("login") or user.get("full_name", "")))
+        self.resize(900, 550)
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        # Панель поиска и сортировки
+        top = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.returnPressed.connect(self.do_search)
+        top.addWidget(QLabel("Поиск:"))
+        top.addWidget(self.search)
+        top.addWidget(btn("Найти", self.do_search))
+        top.addWidget(btn("Все", lambda: self.load()))
+        top.addWidget(btn("Цена ↑", lambda: self.set_sort("ASC")))
+        top.addWidget(btn("Цена ↓", lambda: self.set_sort("DESC")))
+        top.addWidget(btn("Выход", self.logout))
+        layout.addLayout(top)
+
+        self.grid_w = QWidget()
+        self.grid = QGridLayout(self.grid_w)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.grid_w)
+        layout.addWidget(scroll)
+        self.setCentralWidget(page)
+        self.load()
+
+    def set_sort(self, order):
+        self.sort = order
+        self.load(self.search.text().strip() or None)
+
+    def do_search(self):
+        self.load(self.search.text().strip() or None)
+
+    def load(self, text=None):
+        # Только доступные товары: не удалены и quantity>0
+        clear_grid(self.grid)
+        sql = "SELECT * FROM products WHERE is_deleted=0 AND quantity>0"
+        params = []
+        if text:
+            sql += " AND name LIKE %s"
+            params.append(f"%{text}%")
+        if self.sort:
+            sql += f" ORDER BY price {self.sort}"
+        row = col = 0
+        for item in db(sql, tuple(params)):
+            frame, box = make_card(280, 390)
+            box.addWidget(show_photo(item.get("image")))
+            box.addWidget(QLabel("<b>" + item["name"] + "</b>"))
+            box.addWidget(QLabel("Цена: " + str(final_price(item["price"], item["discount"])) + " руб"))
+            btns = QHBoxLayout()
+            pid = item["id"]
+            btns.addWidget(btn("Подробнее", lambda checked=False, x=pid: self.detail(x)))
+            box.addLayout(btns)
+            self.grid.addWidget(frame, row, col)
+            col += 1
+            if col == 3:
+                col, row = 0, row + 1
+
+    def detail(self, product_id):
+        # Окно с подробной информацией о товаре
+        item = db("SELECT * FROM products WHERE id=%s", (product_id,), one=True)
+        if not item:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(item["name"])
+        box = QVBoxLayout(dialog)
+        p = img_path(item.get("image"))
+        if p:
+            photo = QLabel()
+            photo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            photo.setScaledContents(True)
+            photo.setPixmap(QPixmap(p).scaled(400, 300, Qt.AspectRatioMode.KeepAspectRatio))
+            box.addWidget(photo)
+        box.addWidget(QLabel("<b>" + item["name"] + "</b>"))
+        if item.get("description"):
+            box.addWidget(QLabel(item["description"]))
+        box.addWidget(QLabel("Цена: " + str(final_price(item["price"], item["discount"])) + " руб"))
+        box.addWidget(btn("Закрыть", dialog.accept))
+        dialog.exec()
+
+    def logout(self):
+        back_login(self.login, self)
+
+    def closeEvent(self, e):
+        if self.login.isHidden() and not self._out:
+            back_login(self.login, self)
+        e.accept()
+
+# --- Запуск приложения ---
+
+if __name__ == "__main__":
+    os.makedirs("images", exist_ok=True)  # папка для фото товаров
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # не закрывать программу при «Выход» из админки
+    app.setStyle("Fusion")
+    app.setStyleSheet(CSS)
+    win = Login()
+    win.show()
+    sys.exit(app.exec())
